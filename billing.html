@@ -1534,6 +1534,238 @@
     </div>
 
 <script>
+    // ===== OFFLINE SUPPORT (Service Worker + IndexedDB + localStorage) =====
+    const OFFLINE_DB_NAME = 'farmgenie_offline_db_v1';
+    const OFFLINE_DB_VERSION = 1;
+    const OFFLINE_API_STORE = 'api_cache';
+    const OFFLINE_LS_PREFIX = 'farmgenie_offline_api_v1:';
+    const OFFLINE_LS_INDEX_KEY = 'farmgenie_offline_api_index_v1';
+    const OFFLINE_LS_MAX_ENTRIES = 80;
+    const OFFLINE_CACHEABLE_HOSTS = new Set(['erp.farmgenie.store', 'www.googleapis.com']);
+    let offlineDbPromise = null;
+
+    function getRequestUrl(input) {
+        if (typeof input === 'string') return input;
+        if (input && input.url) return input.url;
+        return '';
+    }
+
+    function getRequestMethod(input, init = {}) {
+        const initMethod = init && init.method ? String(init.method).toUpperCase() : '';
+        if (initMethod) return initMethod;
+        if (input && input.method) return String(input.method).toUpperCase();
+        return 'GET';
+    }
+
+    function shouldCacheApiRequest(input, init = {}) {
+        const method = getRequestMethod(input, init);
+        if (method !== 'GET') return false;
+
+        const requestUrl = getRequestUrl(input);
+        if (!requestUrl) return false;
+
+        try {
+            const url = new URL(requestUrl, window.location.href);
+            if (url.hostname === '127.0.0.1' || url.hostname === 'localhost') return false;
+            return OFFLINE_CACHEABLE_HOSTS.has(url.hostname);
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function getOfflineCacheKey(input) {
+        const requestUrl = getRequestUrl(input);
+        try {
+            const parsed = new URL(requestUrl, window.location.href);
+            parsed.hash = '';
+            return parsed.toString();
+        } catch (e) {
+            return requestUrl;
+        }
+    }
+
+    function openOfflineDb() {
+        if (!('indexedDB' in window)) return Promise.resolve(null);
+        if (offlineDbPromise) return offlineDbPromise;
+
+        offlineDbPromise = new Promise((resolve) => {
+            const req = indexedDB.open(OFFLINE_DB_NAME, OFFLINE_DB_VERSION);
+            req.onupgradeneeded = () => {
+                const db = req.result;
+                if (!db.objectStoreNames.contains(OFFLINE_API_STORE)) {
+                    db.createObjectStore(OFFLINE_API_STORE, { keyPath: 'key' });
+                }
+            };
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => resolve(null);
+        });
+
+        return offlineDbPromise;
+    }
+
+    async function idbSetCachedApiPayload(key, payload) {
+        const db = await openOfflineDb();
+        if (!db) return false;
+
+        return new Promise((resolve) => {
+            try {
+                const tx = db.transaction(OFFLINE_API_STORE, 'readwrite');
+                tx.objectStore(OFFLINE_API_STORE).put({ key, payload, savedAt: Date.now() });
+                tx.oncomplete = () => resolve(true);
+                tx.onerror = () => resolve(false);
+            } catch (e) {
+                resolve(false);
+            }
+        });
+    }
+
+    async function idbGetCachedApiPayload(key) {
+        const db = await openOfflineDb();
+        if (!db) return null;
+
+        return new Promise((resolve) => {
+            try {
+                const tx = db.transaction(OFFLINE_API_STORE, 'readonly');
+                const req = tx.objectStore(OFFLINE_API_STORE).get(key);
+                req.onsuccess = () => {
+                    const row = req.result;
+                    resolve(row ? row.payload : null);
+                };
+                req.onerror = () => resolve(null);
+            } catch (e) {
+                resolve(null);
+            }
+        });
+    }
+
+    function trimOfflineLocalStorageIndex(indexList) {
+        while (indexList.length > OFFLINE_LS_MAX_ENTRIES) {
+            const oldKey = indexList.shift();
+            try {
+                localStorage.removeItem(OFFLINE_LS_PREFIX + oldKey);
+            } catch (e) {}
+        }
+        return indexList;
+    }
+
+    function localStorageSetCachedApiPayload(key, payload) {
+        try {
+            localStorage.setItem(OFFLINE_LS_PREFIX + key, JSON.stringify(payload));
+            const rawIndex = localStorage.getItem(OFFLINE_LS_INDEX_KEY);
+            const indexList = rawIndex ? JSON.parse(rawIndex) : [];
+            const filtered = indexList.filter(k => k !== key);
+            filtered.push(key);
+            localStorage.setItem(OFFLINE_LS_INDEX_KEY, JSON.stringify(trimOfflineLocalStorageIndex(filtered)));
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function localStorageGetCachedApiPayload(key) {
+        try {
+            const raw = localStorage.getItem(OFFLINE_LS_PREFIX + key);
+            return raw ? JSON.parse(raw) : null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    async function persistApiPayloadOffline(key, payload) {
+        const savedToIdb = await idbSetCachedApiPayload(key, payload);
+        if (!savedToIdb) {
+            localStorageSetCachedApiPayload(key, payload);
+            return;
+        }
+        localStorageSetCachedApiPayload(key, payload);
+    }
+
+    async function loadApiPayloadOffline(key) {
+        const fromIdb = await idbGetCachedApiPayload(key);
+        if (fromIdb) return fromIdb;
+        return localStorageGetCachedApiPayload(key);
+    }
+
+    function headersToObject(headers) {
+        const out = {};
+        if (!headers || typeof headers.forEach !== 'function') return out;
+        headers.forEach((value, key) => {
+            out[key] = value;
+        });
+        return out;
+    }
+
+    function responseFromOfflinePayload(payload) {
+        if (!payload || typeof payload.body !== 'string') return null;
+        const hdrs = payload.headers && typeof payload.headers === 'object'
+            ? payload.headers
+            : { 'content-type': 'application/json' };
+        const status = payload.status || 200;
+        return new Response(payload.body, { status, headers: hdrs });
+    }
+
+    function installOfflineFetchProxy() {
+        if (!window.fetch || window.__offlineFetchProxyInstalled) return;
+        window.__offlineFetchProxyInstalled = true;
+
+        const originalFetch = window.fetch.bind(window);
+        window.fetch = async (input, init = {}) => {
+            if (!shouldCacheApiRequest(input, init)) {
+                return originalFetch(input, init);
+            }
+
+            const cacheKey = getOfflineCacheKey(input);
+            try {
+                const networkResponse = await originalFetch(input, init);
+                if (networkResponse && networkResponse.ok) {
+                    try {
+                        const clone = networkResponse.clone();
+                        const bodyText = await clone.text();
+                        await persistApiPayloadOffline(cacheKey, {
+                            url: getRequestUrl(input),
+                            status: clone.status,
+                            headers: headersToObject(clone.headers),
+                            body: bodyText,
+                            savedAt: Date.now()
+                        });
+                    } catch (cacheErr) {}
+                }
+                return networkResponse;
+            } catch (networkErr) {
+                const offlinePayload = await loadApiPayloadOffline(cacheKey);
+                const cachedResponse = responseFromOfflinePayload(offlinePayload);
+                if (cachedResponse) {
+                    return cachedResponse;
+                }
+                throw networkErr;
+            }
+        };
+    }
+
+    async function registerBillingServiceWorker() {
+        if (!('serviceWorker' in navigator)) {
+            console.warn('Service worker is not supported in this browser.');
+            return;
+        }
+
+        if (!window.isSecureContext) {
+            console.warn('Offline page shell requires HTTPS or localhost. Current origin is not secure.');
+            return;
+        }
+
+        try {
+            const registration = await navigator.serviceWorker.register('./sw-billing.js', { scope: './' });
+            if (registration && registration.update) {
+                registration.update().catch(() => {});
+            }
+        } catch (err) {
+            console.warn('Service worker registration failed:', err.message);
+        }
+    }
+
+    installOfflineFetchProxy();
+    registerBillingServiceWorker();
+
     // ===== STATE =====
     let selectedCustomer = null;
     let selectedCashier = null;
